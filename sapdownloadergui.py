@@ -9,12 +9,14 @@ import gc
 import shutil
 import threading
 import pythoncom
+import tempfile
 import tkinter as tk
 from tkinter import scrolledtext, ttk, messagebox
 
 # --- INSTELLINGEN ---
 DOWNLOAD_MAP = os.path.join(os.path.expanduser("~"), "EQUANS", "Projects Elek Wetteren - Documenten")
-TIJDELIJKE_OPSLAG = os.path.join(os.getcwd(), "TEMP_BEX_DOWNLOADS")
+# Gebruik OS temp ipv (mogelijk) OneDrive/werkmap om locks/sync issues te vermijden.
+TIJDELIJKE_OPSLAG = os.path.join(tempfile.gettempdir(), "TEMP_BEX_DOWNLOADS")
 
 SITES = [
     {"naam": "Ageing Balance", "url": "https://vheqnbpeci.sap.myequans.com:50001/irj/servlet/prt/portal/prtroot/pcd!3aportal_content!2fcom.sap.pct!2fplatform_add_ons!2fcom.sap.ip.bi!2fiViews!2fcom.sap.ip.bi.bex?BOOKMARK=CJ8INZ0NKWJE5I0NXFYRGX2XQ", "bestandsnaam": "Ageing Balance.xlsx", "vul_datum": True},
@@ -105,8 +107,32 @@ class App:
         try:
             abs_bron = os.path.abspath(bron_pad)
             abs_doel = os.path.abspath(os.path.join(doel_map, finale_naam))
+
+            # Zorg dat doelmap bestaat
+            os.makedirs(os.path.dirname(abs_doel), exist_ok=True)
+
+            # Sluit eventueel geopende workbooks met dezelfde naam (voorkomt "zelfde naam reeds geopend")
+            try:
+                bron_basename = os.path.basename(abs_bron).lower()
+                doel_basename = os.path.basename(abs_doel).lower()
+                try:
+                    count = int(excel_app.Workbooks.Count)
+                except:
+                    count = 0
+
+                for idx in range(1, count + 1):
+                    try:
+                        open_wb = excel_app.Workbooks(idx)
+                        name = str(open_wb.Name).lower()
+                        full = str(open_wb.FullName).lower()
+                        if name in {bron_basename, doel_basename} or full in {abs_bron.lower(), abs_doel.lower()}:
+                            open_wb.Close(SaveChanges=False)
+                    except:
+                        pass
+            except:
+                pass
             
-            wb = excel_app.Workbooks.Open(abs_bron)
+            wb = excel_app.Workbooks.Open(abs_bron, UpdateLinks=0, ReadOnly=True)
             try: wb.Worksheets(1).Name = "YANALYSIS_PATTERN"
             except: pass
 
@@ -122,6 +148,34 @@ class App:
                 try: wb.Close(SaveChanges=False)
                 except: pass
             return False
+
+    def wacht_op_bestand(self, pad, timeout_s=30):
+        """Wacht tot bestand bestaat én niet leeg is (Playwright save_as is meestal sync, maar dit maakt het robuuster)."""
+        start = time.time()
+        last_size = -1
+        stable_count = 0
+
+        while time.time() - start < timeout_s:
+            if os.path.exists(pad):
+                try:
+                    size = os.path.getsize(pad)
+                except OSError:
+                    size = 0
+
+                if size > 0 and size == last_size:
+                    stable_count += 1
+                else:
+                    stable_count = 0
+
+                last_size = size
+
+                # 2 opeenvolgende metingen met dezelfde size => "stabiel genoeg"
+                if stable_count >= 2:
+                    return True
+
+            time.sleep(0.25)
+
+        return False
 
     def run_process(self):
         pythoncom.CoInitialize()
@@ -189,10 +243,13 @@ class App:
                             with launcher_page.expect_download(timeout=60000) as download_info:
                                 download = download_info.value
                             
-                            temp_raw = os.path.join(TIJDELIJKE_OPSLAG, f"raw_{site['bestandsnaam']}.xls")
+                            # Voorkom dubbele extensie zoals "raw_*.xlsx.xls"
+                            basisnaam, _ext = os.path.splitext(site["bestandsnaam"])
+                            temp_raw = os.path.join(TIJDELIJKE_OPSLAG, f"raw_{basisnaam}.xls")
                             download.save_as(temp_raw)
                             
-                            time.sleep(2) 
+                            if not self.wacht_op_bestand(temp_raw, timeout_s=30):
+                                raise RuntimeError(f"Downloadbestand niet (tijdig) beschikbaar: {temp_raw}")
 
                             if self.converteer_bestand(excel_app, temp_raw, TIJDELIJKE_OPSLAG, site['bestandsnaam']):
                                 geslaagde_downloads.append(site['bestandsnaam'])
